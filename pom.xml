@@ -29,4 +29,11 @@
   <scm>
   	<developerConnection>Aritra Saha</developerConnection>
   </scm>
+  <dependencies>
+  	<dependency>
+  		<groupId>de.u-mass</groupId>
+  		<artifactId>lastfm-java</artifactId>
+  		<version>0.1.2</version>
+  	</dependency>
+  </dependencies>
 </project>
