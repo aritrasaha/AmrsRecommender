@@ -1,7 +1,6 @@
 require.config({
     baseUrl : "assets",
     paths : {
-        "app" : "resources",
         "angular" : "libs/angular-1.2.16/angular.min",
         "angular-ui-bootstrap" : "libs/angular-ui/ui-bootstrap-tpls-0.10.0.min",
         "bootstrap" : "libs/bootstrap-3.1.1-dist/js/bootstrap.min",
@@ -20,6 +19,6 @@ require.config({
     }
 });
 
-require([ "app/amrs" ], function() {
+require([ "resources/amrs" ], function() {
     console.log("I'm done loading");
 });
