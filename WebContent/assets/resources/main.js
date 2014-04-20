@@ -7,7 +7,7 @@ require.config({
         "jquery" : "libs/jQuery/jquery-2.1.0.min"
     },
     shim : {
-        "angular-ui-bootstrap" : {
+    	"angular-ui-bootstrap" : {
             deps : [ "angular", "bootstrap" ]
         },
         "bootstrap" : {
@@ -19,6 +19,3 @@ require.config({
     }
 });
 
-require([ "resources/amrs" ], function() {
-    console.log("I'm done loading");
-});
