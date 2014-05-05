@@ -3,6 +3,7 @@
 	<name>AMRS Recommender</name>
 	<comment></comment>
 	<projects>
+		<project>AMRS Loader</project>
 	</projects>
 	<buildSpec>
 		<buildCommand>

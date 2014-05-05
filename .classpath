@@ -22,5 +22,9 @@
 			<attribute name="org.eclipse.jst.component.dependency" value="/WEB-INF/lib"/>
 		</attributes>
 	</classpathentry>
+	<classpathentry combineaccessrules="false" kind="src" path="/AMRS Loader"/>
+	<classpathentry kind="lib" path="/AMRS Loader/lib/jarh5obj.jar"/>
+	<classpathentry kind="lib" path="/AMRS Loader/lib/jarhdf5-2.10.0.jar"/>
+	<classpathentry kind="lib" path="/AMRS Loader/lib/jarhdfobj.jar"/>
 	<classpathentry kind="output" path="target/classes"/>
 </classpath>
