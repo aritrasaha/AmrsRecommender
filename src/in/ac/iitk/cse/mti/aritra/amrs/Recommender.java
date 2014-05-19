@@ -13,7 +13,6 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintStream;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.ArrayList;
@@ -27,6 +26,8 @@ import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+import javax.servlet.ServletException;
+
 import redis.clients.jedis.Jedis;
 
 /**
@@ -34,63 +35,55 @@ import redis.clients.jedis.Jedis;
  * 
  */
 public class Recommender {
-	private final String msdHome;
 	private final String dataLocation;
 	private final String userHistoryLocation;
 	private final String userTagsLocation;
 	private final String usersFileLocation;
 
 	private final Map<String, Double> userRecommendations;
+	private final Map<String, Double> userSimilarities;
 	private final MillionSongDataset msdCache;
 	private final Jedis[] dbServers;
-	private Connection conn;
+	private final Connection conn;
 
-	private final static int kUsers = 50;
-	private final static int recentTrackLength = 100;
-	private final static int moodLength = 10;
-	private final static int threadCount = 8;
-	private final static int recommendationCount = 5;
-	private final static int testTracksCount = 2;
+	private int threadCount;
 
 	private final PrintStream originalStream;
 	private final PrintStream dummyStream;
 
 	private final Logger logger;
 
+	public Recommender(String dataLocation, MillionSongDataset msdCache,
+			Connection conn) {
+		this(dataLocation, msdCache, conn, 16);
+	}
+
 	/**
 	 * @param dataLocation
 	 * @param msdCache
 	 */
-	public Recommender(String dataLocation, MillionSongDataset msdCache) {
+	public Recommender(String dataLocation, MillionSongDataset msdCache,
+			Connection conn, int threadCount) {
 		usersFileLocation = dataLocation + File.separatorChar + "users";
 		this.dataLocation = dataLocation + File.separatorChar + "amrs";
-		msdHome = this.dataLocation + File.separatorChar + "MillionSong";
+
 		userHistoryLocation = this.dataLocation + File.separatorChar
 				+ "userhistory";
 		userTagsLocation = this.dataLocation + File.separatorChar + "usertags";
+
 		this.msdCache = msdCache;
+		this.threadCount = threadCount;
 
-		dbServers = new Jedis[Recommender.threadCount];
-		for (int i = 0; i < Recommender.threadCount; i++) {
-			Jedis dbServer = new Jedis("127.0.0.1");
-			dbServer.connect();
-			dbServers[i] = dbServer;
+		dbServers = new Jedis[threadCount];
+		for (int i = 0; i < threadCount; i++) {
+			dbServers[i] = new Jedis("127.0.0.1");
+			dbServers[i].connect();
 		}
 
-		try {
-			Class.forName("org.sqlite.JDBC");
-			String dbLocation = msdHome + File.separatorChar
-					+ "AdditionalFiles" + File.separatorChar + "a_tag_pool.db";
-			conn = DriverManager.getConnection("jdbc:sqlite:" + dbLocation);
-			conn.setAutoCommit(false);
-			System.out.println("Opened database successfully");
-		} catch (Exception e) {
-			conn = null;
-			System.err.println(e.getClass().getName() + ": " + e.getMessage());
-			System.exit(0);
-		}
+		this.conn = conn;
 
 		userRecommendations = new HashMap<String, Double>();
+		userSimilarities = new HashMap<String, Double>();
 
 		originalStream = System.out;
 		dummyStream = new PrintStream(new OutputStream() {
@@ -102,6 +95,20 @@ public class Recommender {
 		logger = Logger.getLogger(this.getClass().getName());
 	}
 
+	/*
+	 * (non-Javadoc)
+	 * 
+	 * @see java.lang.Object#finalize()
+	 */
+	@Override
+	protected void finalize() throws Throwable {
+		for (Jedis dbServer : dbServers) {
+			dbServer.close();
+		}
+		System.setOut(originalStream);
+		super.finalize();
+	}
+
 	/**
 	 * @param costs
 	 */
@@ -110,7 +117,7 @@ public class Recommender {
 			for (double element : row) {
 				print("" + element);
 			}
-			print("");
+			println("");
 		}
 	}
 
@@ -131,7 +138,7 @@ public class Recommender {
 	/**
 	 * @return
 	 */
-	private ArrayList<String> getAllUsers() {
+	public ArrayList<String> getAllUsers() {
 		ArrayList<String> users = new ArrayList<String>();
 		File usersFile = new File(usersFileLocation);
 		if (!usersFile.exists()) {
@@ -147,7 +154,7 @@ public class Recommender {
 					users.add(user);
 					count++;
 					if (count == 422) {
-						break;
+						continue;
 					}
 				}
 				br.close();
@@ -156,24 +163,6 @@ public class Recommender {
 			}
 		}
 		return users;
-	}
-
-	/**
-	 * @param userTags
-	 * @param similarUserTags
-	 * @return
-	 */
-	private double findUserSimilarity(ArrayList<Double> userTags,
-			ArrayList<Double> similarUserTags) {
-		if (userTags.size() != similarUserTags.size()) {
-			System.err.println("WARNING: Normalized tag size does not match");
-		}
-		double similarity = 0;
-		for (int i = 0; i < userTags.size(); i++) {
-			similarity += Math.min(userTags.get(i), similarUserTags.get(i))
-					- Math.abs(userTags.get(i) - similarUserTags.get(i));
-		}
-		return similarity;
 	}
 
 	/**
@@ -232,22 +221,23 @@ public class Recommender {
 	 */
 	private ArrayList<String> findSimilarUsers(String user, int limit) {
 		ArrayList<String> users = getAllUsers();
-		Map<String, Double> userSimilarities = new HashMap<String, Double>();
 		ArrayList<String> similarUsers = new ArrayList<String>();
 
 		ArrayList<Double> userTags = getNormalizedTags(user);
 
 		// otherwise return empty list
 		if (userTags.size() > 0) {
-			for (String otherUser : users) {
-				if (!otherUser.equalsIgnoreCase(user)) {
-					ArrayList<Double> similarUserTags = getNormalizedTags(otherUser);
-					// otherwise skip user
-					if (similarUserTags.size() > 0) {
-						double userSimilarity = findUserSimilarity(userTags,
-								similarUserTags);
-						userSimilarities.put(otherUser, userSimilarity);
-					}
+			ArrayList<Thread> threads = new ArrayList<Thread>();
+			for (int i = 0; i < threadCount; i++) {
+				Thread t = new SimilarUsers(user, userTags, users, i);
+				threads.add(t);
+				t.start();
+			}
+			for (Thread t : threads) {
+				try {
+					t.join();
+				} catch (InterruptedException e) {
+					e.printStackTrace();
 				}
 			}
 
@@ -256,6 +246,7 @@ public class Recommender {
 			List<Entry<String, Double>> list = new ArrayList<Entry<String, Double>>(
 					set);
 			Collections.sort(list, new Comparator<Map.Entry<String, Double>>() {
+				@Override
 				public int compare(Map.Entry<String, Double> o1,
 						Map.Entry<String, Double> o2) {
 					return o2.getValue().compareTo(o1.getValue());
@@ -280,16 +271,18 @@ public class Recommender {
 	 * @return
 	 */
 	private double getHistorySimilarity(List<String> trackIds1,
-			List<String> trackIds2, int threadId) {
+			List<String> trackIds2, int artistWTG, int loudnessWTG,
+			int tempoWTG, int threadId) {
 		int dimension = trackIds1.size();
 		double[][] costs = new double[dimension][dimension];
 		for (int i = 0; i < trackIds1.size(); i++) {
 			for (int j = 0; j < trackIds2.size(); j++) {
 				costs[i][j] = getTrackSimilarity(trackIds1.get(i),
-						trackIds2.get(j), threadId) + 2;
+						trackIds2.get(j), artistWTG, loudnessWTG, tempoWTG,
+						threadId);
 			}
 		}
-		double similarity = (getCost(costs) - 2 * dimension) / dimension;
+		double similarity = getCost(costs) / dimension;
 		return similarity;
 	}
 
@@ -300,7 +293,9 @@ public class Recommender {
 	 * @return
 	 */
 	private Map<String, Double> getUserRecommendation(
-			ArrayList<String> trackIds, String user, int threadId) {
+			ArrayList<String> trackIds, String user, int moodLength,
+			int artistWTG, int loudnessWTG, int tempoWTG, int similarityWTG,
+			int popularityWTG, int threadId) {
 		Map<String, Double> recommendation = new HashMap<String, Double>();
 
 		ArrayList<String> similarUserTrackIds = new ArrayList<String>();
@@ -319,20 +314,23 @@ public class Recommender {
 			ioe.printStackTrace();
 		}
 		int trackCount = similarUserTrackIds.size();
-		if (trackCount > Recommender.moodLength + 1) {
-			for (int offset = 1; offset < Math.min(
-					Recommender.recentTrackLength, trackCount)
-					- Recommender.moodLength - 1; offset++) {
+		if (trackCount > moodLength + 1) {
+			// int limit = Math.min(Recommender.recentTrackLength, trackCount)
+			// - (Recommender.moodLength + 1);
+			int limit = trackCount - (moodLength + 1);
+			for (int offset = 1; offset < limit; offset++) {
 				List<String> compareWith = similarUserTrackIds.subList(offset,
-						offset + Recommender.moodLength);
-				double score = getHistorySimilarity(trackIds, compareWith,
-						threadId);
-				try {
-					recommendation.put(similarUserTrackIds.get(offset - 1),
-							score);
-				} catch (Exception e) {
-					e.printStackTrace();
-				}
+						offset + moodLength);
+
+				double similarity = getHistorySimilarity(trackIds, compareWith,
+						artistWTG, loudnessWTG, tempoWTG, threadId);
+				String nextTrackId = similarUserTrackIds.get(offset - 1);
+				double trackPopularity = (Double) msdCache.getTrackFeatures(
+						nextTrackId, dbServers[threadId])
+						.get("song_hotttnesss");
+				double score = similarity * (similarityWTG / 100.0)
+						+ trackPopularity * (popularityWTG / 100.0);
+				recommendation.put(nextTrackId, score);
 			}
 		} else {
 			System.err.println("Not enough history, skipping user: " + user);
@@ -341,15 +339,23 @@ public class Recommender {
 		return recommendation;
 	}
 
+	public List<Entry<String, Double>> recommend(String user)
+			throws ServletException {
+		return recommend(user, 50, 5, 10, 60, 20, 20, 80, 20);
+	}
+
 	/**
 	 * @param user
+	 * @return
 	 */
-	public void recommend(String user) {
+	public List<Entry<String, Double>> recommend(String user, int kUsers,
+			int moodLength, int testTracksCount, int artistWTG,
+			int loudnessWTG, int tempoWTG, int similarityWTG, int popularityWTG)
+			throws ServletException {
 		print("Recommendations for User: " + user);
 		long start = System.currentTimeMillis();
 
-		ArrayList<String> similarUsers = findSimilarUsers(user,
-				Recommender.kUsers);
+		ArrayList<String> similarUsers = findSimilarUsers(user, kUsers);
 
 		ArrayList<String> userTestTrackIds = new ArrayList<String>();
 		ArrayList<String> userTrackIds = new ArrayList<String>();
@@ -361,10 +367,9 @@ public class Recommender {
 					userHistoryFile));
 			String line = null;
 			while ((line = br.readLine()) != null
-					&& trackCount < Recommender.moodLength
-							+ Recommender.testTracksCount) {
+					&& trackCount < moodLength + testTracksCount) {
 				String trackId = line.split(":")[1];
-				if (trackCount < Recommender.testTracksCount) {
+				if (trackCount < testTracksCount) {
 					userTestTrackIds.add(trackId);
 				} else {
 					userTrackIds.add(trackId);
@@ -377,10 +382,12 @@ public class Recommender {
 		}
 
 		int trackCount = userTrackIds.size();
-		if (trackCount == Recommender.moodLength) {
+		if (trackCount == moodLength) {
 			ArrayList<Thread> threads = new ArrayList<Thread>();
-			for (int i = 0; i < Recommender.threadCount; i++) {
-				Thread t = new CompareUsers(userTrackIds, similarUsers, i);
+			for (int i = 0; i < threadCount; i++) {
+				Thread t = new CompareUsers(userTrackIds, similarUsers,
+						moodLength, artistWTG, loudnessWTG, tempoWTG,
+						similarityWTG, popularityWTG, i);
 				threads.add(t);
 				t.start();
 			}
@@ -401,33 +408,27 @@ public class Recommender {
 			String time = String.format("%02d:%02d:%02d:%d", hour, minute,
 					second, millis);
 			print("Time taken: " + time);
-
-			testRecommendations(userTestTrackIds);
+			print("Test Result: " + testRecommendations(userTestTrackIds));
+			return getSortedRecommendations().subList(0, 10);
 		} else {
 			System.err.println("Not enough history present.");
+			throw new ServletException("Not enough history present.");
 		}
 	}
 
 	/**
 	 * @param userTestTrackIds
 	 */
-	private void testRecommendations(ArrayList<String> userTestTrackIds) {
-		String toPrint = "Testing Recommendations" + "\n";
-		for (String userTrackid : userTestTrackIds) {
-			String testTitle = (String) msdCache.getTrackFeatures(userTrackid,
-					dbServers[0]).get("title");
-			toPrint += "\n" + testTitle + "\n";
-			for (Entry<String, Double> recommendedTrackId : getSortedRecommendations(Recommender.recommendationCount)) {
-				double similarity = getTrackSimilarity(userTrackid,
-						recommendedTrackId.getKey(), 0);
-				String trackId = recommendedTrackId.getKey();
-				String recommendationTitle = (String) msdCache
-						.getTrackFeatures(trackId, dbServers[0]).get("title");
-				String temp = similarity + " : " + recommendationTitle;
-				toPrint += temp + "\n";
+	private double testRecommendations(ArrayList<String> userTestTrackIds) {
+		double matchIndex = 0;
+		for (Entry<String, Double> recommendedTrack : getSortedRecommendations()) {
+			matchIndex++;
+			String recommendedTrackId = recommendedTrack.getKey();
+			if (userTestTrackIds.contains(recommendedTrackId)) {
+				return matchIndex;
 			}
 		}
-		print(toPrint);
+		return 0;
 	}
 
 	/**
@@ -458,8 +459,8 @@ public class Recommender {
 	 * @param vector2
 	 * @return
 	 */
-	private double cosineSimilarity(ArrayList<Integer> vector1,
-			ArrayList<Integer> vector2) {
+	private double cosineSimilarity(ArrayList<Double> vector1,
+			ArrayList<Double> vector2) {
 		double dotProduct = 0.0;
 		double normA = 0.0;
 		double normB = 0.0;
@@ -480,27 +481,15 @@ public class Recommender {
 	 * @return
 	 */
 	private double getArtistSimilarity(String artistId1, String artistId2) {
-		ArrayList<Integer> artist1TagPool = new ArrayList<Integer>();
-		ArrayList<Integer> artist2TagPool = new ArrayList<Integer>();
+		ArrayList<Double> artist1TagPool = new ArrayList<Double>();
+		ArrayList<Double> artist2TagPool = new ArrayList<Double>();
 		for (String rawTag : getArtistTags(artistId1)) {
-			artist1TagPool.add(Integer.parseInt(rawTag));
+			artist1TagPool.add(Double.parseDouble(rawTag));
 		}
 		for (String rawTag : getArtistTags(artistId2)) {
-			artist2TagPool.add(Integer.parseInt(rawTag));
+			artist2TagPool.add(Double.parseDouble(rawTag));
 		}
 		return cosineSimilarity(artist1TagPool, artist2TagPool);
-	}
-
-	/**
-	 * @param value1
-	 * @param value2
-	 * @return
-	 */
-	private double computeDistance(double value1, double value2) {
-		if (value1 == 0 || value2 == 0) {
-			return 0.0;
-		}
-		return 1 - Math.abs((value1 - value2) / (value1 + value2));
 	}
 
 	/**
@@ -510,48 +499,50 @@ public class Recommender {
 	 * @return
 	 */
 	private double getTrackSimilarity(String trackId1, String trackId2,
-			int threadId) {
-		double[] weight = { 0.25, 0.25, 0.25, 0.25 };
-		double[] distances = new double[weight.length];
-
+			int artistWTG, int loudnessWTG, int tempoWTG, int threadId) {
 		Map<String, Object> trackFeatures1 = msdCache.getTrackFeatures(
 				trackId1, dbServers[threadId]);
 		Map<String, Object> trackFeatures2 = msdCache.getTrackFeatures(
 				trackId2, dbServers[threadId]);
 
-		distances[0] = getArtistSimilarity(
-				(String) trackFeatures1.get("artist_id"),
-				(String) trackFeatures2.get("artist_id"));
-		distances[1] = computeDistance((Double) trackFeatures1.get("loudness"),
-				(Double) trackFeatures2.get("loudness"));
-		distances[2] = (Double) trackFeatures2.get("song_hotttnesss");
-		distances[3] = computeDistance((Double) trackFeatures1.get("tempo"),
-				(Double) trackFeatures2.get("tempo"));
+		double similarity = 0.0;
+		double tempSim = 0.0;
 
-		double distance = 0;
-		for (int i = 0; i < distances.length; i++) {
-			distance += distances[i] * weight[i];
-		}
-		return 1 - distance;
+		// Artist Similarity
+		tempSim = getArtistSimilarity((String) trackFeatures1.get("artist_id"),
+				(String) trackFeatures2.get("artist_id"));
+		similarity += tempSim * (artistWTG / 100.0);
+
+		// Loudness Similarity
+		double loudness1 = (Double) trackFeatures1.get("loudness");
+		double loudness2 = (Double) trackFeatures2.get("loudness");
+		tempSim = 1.0 - (Math.abs(loudness2 - loudness1) - (-100.0)) / 200.0;
+		similarity += tempSim * (loudnessWTG / 100.0);
+
+		// Tempo Similarity
+		double tempo1 = (Double) trackFeatures1.get("tempo");
+		double tempo2 = (Double) trackFeatures2.get("tempo");
+		tempSim = 1.0 - (Math.abs(tempo2 - tempo1) - 0.0) / 500.0;
+		similarity += tempSim * (tempoWTG / 100.0);
+
+		return 1 - similarity;
 	}
 
 	/**
 	 * @param limit
 	 * @return
 	 */
-	private List<Entry<String, Double>> getSortedRecommendations(int limit) {
+	private List<Entry<String, Double>> getSortedRecommendations() {
 		Set<Entry<String, Double>> set = userRecommendations.entrySet();
 		List<Entry<String, Double>> list = new ArrayList<Entry<String, Double>>(
 				set);
-		Collections.sort(list, new Comparator<Map.Entry<String, Double>>() {
-			public int compare(Map.Entry<String, Double> o1,
-					Map.Entry<String, Double> o2) {
+		Collections.sort(list, new Comparator<Entry<String, Double>>() {
+			@Override
+			public int compare(Entry<String, Double> o1,
+					Entry<String, Double> o2) {
 				return o2.getValue().compareTo(o1.getValue());
 			}
 		});
-		if (limit >= 0) {
-			return list.subList(0, limit);
-		}
 		return list;
 	}
 
@@ -560,15 +551,19 @@ public class Recommender {
 	 */
 	private void printRecommendations() {
 		String recommendations = "";
-		for (Map.Entry<String, Double> entry : getSortedRecommendations(Recommender.recommendationCount)) {
+		int limit = 10;
+		for (Entry<String, Double> entry : getSortedRecommendations()) {
+			if (limit <= 0) {
+				break;
+			}
 			String trackId = entry.getKey();
 			String title = (String) msdCache.getTrackFeatures(trackId,
 					dbServers[0]).get("title");
 			double score = entry.getValue();
 			recommendations += score + " : " + title + "\n";
+			limit--;
 		}
 		print("Recommendations: " + "\n" + recommendations);
-
 	}
 
 	/**
@@ -579,21 +574,29 @@ public class Recommender {
 		userRecommendations.putAll(recommendation);
 	}
 
-	/**
-	 * @param text
-	 */
+	private synchronized void updateSimilarUsers(
+			Map<String, Double> userSimilarity) {
+		userSimilarities.putAll(userSimilarity);
+	}
+
 	private void print(String text) {
 		logger.log(Level.INFO, text);
 	}
 
-	/**
-	 * @author aritra
-	 * 
-	 */
+	private void println(String text) {
+		print(text + "\n");
+	}
+
 	private class CompareUsers extends Thread {
 		private final int index;
 		private final ArrayList<String> currentUserTrackIds;
 		private final ArrayList<String> similarUsers;
+		private final int moodLength;
+		private final int artistWTG;
+		private final int loudnessWTG;
+		private final int tempoWTG;
+		private final int similarityWTG;
+		private final int popularityWTG;
 
 		/**
 		 * @param currentUserTrackIds
@@ -601,9 +604,58 @@ public class Recommender {
 		 * @param index
 		 */
 		public CompareUsers(ArrayList<String> currentUserTrackIds,
-				ArrayList<String> similarUsers, int index) {
+				ArrayList<String> similarUsers, int moodLength, int artistWTG,
+				int loudnessWTG, int tempoWTG, int similarityWTG,
+				int popularityWTG, int index) {
 			this.currentUserTrackIds = currentUserTrackIds;
 			this.similarUsers = similarUsers;
+			this.index = index;
+			this.moodLength = moodLength;
+			this.artistWTG = artistWTG;
+			this.loudnessWTG = loudnessWTG;
+			this.tempoWTG = tempoWTG;
+			this.similarityWTG = similarityWTG;
+			this.popularityWTG = popularityWTG;
+		}
+
+		/*
+		 * (non-Javadoc)
+		 * 
+		 * @see java.lang.Thread#run()
+		 */
+		@Override
+		public void run() {
+			Map<String, Double> recommendations = new HashMap<String, Double>();
+			for (int i = 0; i < similarUsers.size(); i++) {
+				if (i % threadCount == index) {
+					String similarUser = similarUsers.get(i);
+					Map<String, Double> recommendation = getUserRecommendation(
+							currentUserTrackIds, similarUser, moodLength,
+							artistWTG, loudnessWTG, tempoWTG, similarityWTG,
+							popularityWTG, index);
+					recommendations.putAll(recommendation);
+				}
+			}
+			updateRecommendations(recommendations);
+		}
+	}
+
+	private class SimilarUsers extends Thread {
+		private final int index;
+		private final String user;
+		private final ArrayList<Double> userTags;
+		private final ArrayList<String> users;
+
+		/**
+		 * @param currentUserTrackIds
+		 * @param similarUsers
+		 * @param index
+		 */
+		public SimilarUsers(String user, ArrayList<Double> userTags,
+				ArrayList<String> users, int index) {
+			this.user = user;
+			this.userTags = userTags;
+			this.users = users;
 			this.index = index;
 		}
 
@@ -614,14 +666,22 @@ public class Recommender {
 		 */
 		@Override
 		public void run() {
-			for (int i = 0; i < similarUsers.size(); i++) {
-				if (i % Recommender.threadCount == index) {
-					String similarUser = similarUsers.get(i);
-					Map<String, Double> recommendation = getUserRecommendation(
-							currentUserTrackIds, similarUser, index);
-					updateRecommendations(recommendation);
+			Map<String, Double> userSimilarities = new HashMap<String, Double>();
+			for (int i = 0; i < users.size(); i++) {
+				if (i % threadCount == index) {
+					String otherUser = users.get(i);
+					if (!otherUser.equalsIgnoreCase(user)) {
+						ArrayList<Double> userTagsSimilarity = getNormalizedTags(otherUser);
+						// otherwise skip user
+						if (userTagsSimilarity.size() > 0) {
+							double userSimilarity = cosineSimilarity(userTags,
+									userTagsSimilarity);
+							userSimilarities.put(otherUser, userSimilarity);
+						}
+					}
 				}
 			}
+			updateSimilarUsers(userSimilarities);
 		}
 	}
 }
