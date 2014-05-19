@@ -7,8 +7,8 @@ define([ "angular", "bootstrap", "angular-ui-bootstrap" ], function () {
         $scope.artistWTG = 60;
         $scope.loudnessWTG = 20;
         $scope.tempoWTG = 20;
-        $scope.similarityWTG = 80;
-        $scope.popularityWTG = 20;
+        $scope.similarityWTG = 65;
+        $scope.popularityWTG = 35;
         
         $scope.recommend = function () {
         	console.log("Mood Length: " + $scope.moodLength);
